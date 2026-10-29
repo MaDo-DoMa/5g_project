@@ -1,4 +1,4 @@
-D# PoC: Edge vs Cloud — pomiar latencji i przepustowości
+# PoC: Edge vs Cloud — pomiar latencji i przepustowości
 
 **Temat pracy:** *Edge Computing and Application-Aware Traffic Steering in 5G Networks*
 
@@ -135,3 +135,77 @@ Plik jest **appendowany** — przed rozpoczęciem nowej serii pomiarów usuń go
 - widać timeouts w client → sprawdź: czy serwer działa (`netstat -ano | findstr 5001`),
   czy zapora/Security Group przepuszcza TCP 5001, czy IP jest poprawne (nie WAN IP za NAT-em bez port-forwardingu),
 - serwer ma zatrzymać się po wylogowaniu z VPS → użyj `nohup ... &` (jak wyżej) lub `tmux`/`screen`.
+
+---
+
+# Wariant 5G: UPF Router z Traffic Steering (DPI) — topologia localhost
+
+Rozbudowa PoC o architekturę **klient–serwer z węzłem sterującym 5G Core**:
+cały ruch UE przechodzi przez router UPF (port **5000**), który na podstawie
+flagi L7 (`APP_TYPE=...`) w uplinku decyduje, czy skierować sesję do serwera
+**Edge** (port **5002**, opóźnienie symulowane **5 ms**) czy **Cloud**
+(port **5001**, opóźnienie symulowane **50 ms**). Węzły końcowe odsyłają
+bufor **1 MB** (`sendall`) i zamykają połączenie (krótkotrwała sesja
+HTTP/REST).
+
+## Topologia
+
+```
+                          +---------------------------------------+
+                          |              127.0.0.1                |
+                          |                                       |
+ +----------+   TCP/5000  |  +-----------+          +----------+  |
+ |    UE    | ------------> | UPF (DPI) | =======> |   Edge   |  |
+ |ue_client |               +-----------+  5 ms    | (5002)   |  |
+ +----------+                   |                      +----------+  |
+                                | eMBB_VIDEO            +----------+  |
+                                ======================> |  Cloud   |  |
+                                       50 ms           | (5001)   |  |
+                                                       +----------+  |
+                          +---------------------------------------+
+```
+
+| Plik | Rola | Port |
+|---|---|---|
+| `edge.py` | serwer Edge (MEC) — `sleep(5 ms)` → 1 MB → FIN | 5002 |
+| `cloud.py` | serwer Cloud (DC) — `sleep(50 ms)` → 1 MB → FIN | 5001 |
+| `upf_router.py` | transparentne proxy + DPI (`APP_TYPE`), steering UL Classifier | 5000 |
+| `ue_client.py` | symulator UE / sonda pomiarowa — 50 żądań na profil | → 5000 |
+| `data_viz.py` | pandas + matplotlib — boxplot latencji, słupkowy throughput | - |
+
+Flagi L7: `APP_TYPE=URLLC_SENSOR` → Edge, `APP_TYPE=eMBB_VIDEO` → Cloud
+(traffic nieznany → Cloud, bezpieczny default).
+
+## Uruchomienie
+
+```bash
+# terminal 1, 2, 3 (kolejność dowolna):
+python edge.py
+python cloud.py
+python upf_router.py
+
+# terminal 4:
+python ue_client.py            # 50 zapytań na profil -> telemetry.csv
+.venv\Scripts\python data_viz.py   # albo: python data_viz.py -> latency_plot.png, throughput_plot.png
+```
+
+Wymagania: `python edge|cloud|upf_router|ue_client` — tylko biblioteka
+standardowa; `data_viz.py` wymaga `pip install pandas matplotlib` (lub
+środowiska `.venv`, jeśli używasz venv z repo).
+
+## Metryki UE (`telemetry.csv`)
+
+| Kolumna | Znaczenie |
+|---|---|
+| `timestamp` | ISO z sekundową rozdzielczością |
+| `profile_type` | `URLLC_Sensor` / `eMBB_Video` |
+| `latency_ms` | czas od `sendall` żądania do **pierwszego** bajtu odpowiedzi (`time.perf_counter`) |
+| `throughput_mbps` | (rozmiar payloadu w megabitach) / (czas wysłania → ostatni bajt 1 MB) |
+
+Interpretacja: rozrzut pudełka (IQR, std) latencji dla `URLLC_Sensor` to
+**jitter** — kluczowe kryterium akceptacji URLLC; eMBB "kupuje" przepustowość
+większą stabilnością okna transmisji, ale płaci RTT do centrum danych.
+
+Uwaga metodologiczna: wyniki loopback nie są reprezentatywne dla sieci
+fizycznej — służą do walidacji mechanizmu steering i demonstracji rozdzielenia
+ścieżek URLLC/eMBB.
